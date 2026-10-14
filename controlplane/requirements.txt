@@ -1,0 +1,40 @@
+# Synapse Control Plane — Python Dependencies
+# Pinned to exact versions for reproducibility (R-5).
+# Run: pip install -r requirements.txt
+
+# Web framework
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+
+# gRPC
+grpcio==1.67.1
+grpcio-tools==1.67.1
+protobuf==5.28.3
+
+# Data / ML
+numpy==2.1.3
+scipy==1.14.1
+pandas==2.2.3
+scikit-learn==1.5.2
+xgboost==2.1.2
+lightgbm==4.5.0
+
+# Storage
+redis==5.2.0           # asyncio support included
+asyncpg==0.30.0
+SQLAlchemy==2.0.36
+
+# Validation
+pydantic==2.9.2
+
+# Testing
+pytest==8.3.3
+pytest-asyncio==0.24.0
+hypothesis==6.116.0
+
+# Analysis / figures (paper-quality vector PDFs)
+matplotlib==3.9.2
+
+# Code quality
+ruff==0.7.1
+mypy==1.13.0

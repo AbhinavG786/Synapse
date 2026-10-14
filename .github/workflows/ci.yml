@@ -1,0 +1,106 @@
+name: Synapse CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  # ------------------------------------------------------------------ #
+  # Go: lint + test                                                    #
+  # ------------------------------------------------------------------ #
+  go:
+    name: Go lint & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+          cache-dependency-path: dataplane/go.sum
+
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@latest
+
+      - name: Go vet
+        working-directory: dataplane
+        run: go vet ./...
+
+      - name: Staticcheck
+        working-directory: dataplane
+        run: staticcheck ./...
+
+      - name: Go test (race detector)
+        working-directory: dataplane
+        run: go test -race -count=1 -timeout=120s ./...
+
+  # ------------------------------------------------------------------ #
+  # Python: lint + test                                                #
+  # ------------------------------------------------------------------ #
+  python:
+    name: Python lint & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: controlplane/requirements.txt
+
+      - name: Install dependencies
+        working-directory: controlplane
+        run: pip install -r requirements.txt
+
+      - name: Ruff lint
+        working-directory: controlplane
+        run: python -m ruff check .
+
+      - name: Mypy type check
+        working-directory: controlplane
+        run: python -m mypy synapse_cp
+
+      - name: Pytest
+        working-directory: controlplane
+        run: python -m pytest -v
+
+  # ------------------------------------------------------------------ #
+  # Docker compose smoke test (infra only)                             #
+  # ------------------------------------------------------------------ #
+  infra-smoke:
+    name: Docker Compose infra smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start infrastructure
+        working-directory: infra
+        run: docker compose up -d redis timescaledb
+
+      - name: Wait for Redis
+        run: |
+          for i in {1..20}; do
+            docker exec synapse-redis redis-cli ping && break || sleep 2
+          done
+
+      - name: Wait for TimescaleDB
+        run: |
+          for i in {1..30}; do
+            docker exec synapse-timescaledb pg_isready -U synapse -d synapse && break || sleep 3
+          done
+
+      - name: Verify TimescaleDB schema
+        run: |
+          docker exec synapse-timescaledb psql -U synapse -d synapse -c "\dt events.*"
+          docker exec synapse-timescaledb psql -U synapse -d synapse -c "\dt config.*"
+
+      - name: Tear down
+        if: always()
+        working-directory: infra
+        run: docker compose down -v

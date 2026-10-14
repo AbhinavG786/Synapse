@@ -1,0 +1,179 @@
+// synapse.proto — Synapse: Contextual MAB Load Balancer
+// Protocol Buffers v3 definitions for:
+//   - PolicySnapshot  (control plane -> data plane, streamed via gRPC)
+//   - TelemetryEvent  (data plane -> control plane, client-stream or Redis)
+//   - AdminService    (data plane REST/WS bridge + control plane introspection)
+//
+// Reference: Li, Chu, Langford, Schapire, WWW 2010 (LinUCB)
+// See docs/MODEL.md for the mapping between math notation and field names.
+//
+// IMPORTANT: feature_spec_version must be bumped whenever the context vector
+// layout or normaliser changes. Go and Python reject snapshots with mismatched
+// feature_spec_version.
+
+syntax = "proto3";
+
+package synapse.v1;
+
+option go_package = "github.com/synapse/proto/synapsepb";
+
+// ============================================================
+// Shared enums
+// ============================================================
+
+enum Algorithm {
+  ALGORITHM_UNSPECIFIED     = 0;
+  ALGORITHM_ROUND_ROBIN     = 1;  // B1
+  ALGORITHM_WEIGHTED_RR     = 2;  // B2
+  ALGORITHM_LEAST_CONN      = 3;  // B3
+  ALGORITHM_P2C             = 4;  // B4 Power-of-Two-Choices
+  ALGORITHM_PEAK_EWMA       = 5;  // B5 Least-Response-Time / Peak-EWMA
+  ALGORITHM_HEURISTIC_SCORE = 6;  // B6 fixed alpha/beta/gamma + EWMA L-hat
+  ALGORITHM_LINUCB          = 7;  // P1 LinUCB (the proposal)
+  ALGORITHM_EPSILON_GREEDY  = 8;  // P2a epsilon-greedy linear
+  ALGORITHM_THOMPSON        = 9;  // P2b Thompson Sampling (linear)
+  ALGORITHM_REACTIVE_EJECT  = 10; // B7 consecutive-5xx ejection baseline
+}
+
+// ============================================================
+// PolicySnapshot — streamed from control plane to proxy
+// ============================================================
+
+// Normaliser stores running mean/std so Go and Python compute identical scores.
+message Normaliser {
+  repeated double mean  = 1;
+  repeated double scale = 2;
+}
+
+// Per-arm LinUCB parameters (disjoint variant, see docs/MODEL.md)
+message ArmParams {
+  string node_id         = 1;
+  repeated double theta  = 2;  // A_a^{-1} b_a, length = d
+  repeated double a_inv  = 3;  // A_a^{-1} row-major, length = d*d (Sherman-Morrison)
+  uint64          n_pulls = 4;
+  double          weight  = 5; // for WRR / heuristic
+}
+
+// HeuristicParams: B6 heuristic-score fixed coefficients.
+// Score(N_i) = alpha*L_hat + beta*C_i + gamma*Q_i  (lower = better)
+message HeuristicParams {
+  double alpha = 1;
+  double beta  = 2;
+  double gamma = 3;
+}
+
+message PolicySnapshot {
+  uint64     version              = 1;
+  int64      created_unix_ms      = 2;
+  int64      ttl_ms               = 3;
+  uint32     feature_spec_version = 4;
+  uint32     d                    = 5;
+  Algorithm  algo                 = 6;
+  double     alpha                = 7;  // LinUCB exploration bonus
+  double     epsilon              = 8;  // epsilon-floor for propensity logging
+  repeated ArmParams  arms        = 9;
+  Normaliser          normaliser  = 10;
+  HeuristicParams     heuristic   = 11;
+}
+
+// ============================================================
+// TelemetryEvent — emitted per request by the proxy
+// ============================================================
+
+message TelemetryEvent {
+  string  req_id           = 1;
+  string  run_id           = 2;
+  int64   timestamp_unix_ms = 3;
+
+  // Request features
+  string  endpoint_class   = 4;
+  string  method           = 5;
+  int64   payload_bytes    = 6;
+  string  auth_tier        = 7;
+
+  // Routing decision
+  string  node_id          = 8;
+  Algorithm algo           = 9;
+  uint64  policy_version   = 10;
+  double  propensity       = 11;
+
+  // Outcome
+  double  t_exec_ms        = 12;
+  int32   status_code      = 13;
+  bool    timed_out        = 14;
+  bool    error            = 15;
+  double  reward           = 16;
+
+  // Context vector for OPE replay (length = d, float64)
+  repeated double context_vector = 17;
+
+  // System features at decision time
+  double  node_cpu_util           = 18;
+  int64   node_in_flight          = 19;
+  int64   node_queue_depth        = 20;
+  double  node_latency_ewma_short = 21;
+  double  node_latency_ewma_long  = 22;
+  double  node_error_rate         = 23;
+  double  node_metric_age_s       = 24;
+}
+
+// ============================================================
+// gRPC Services
+// ============================================================
+
+// Control plane -> proxy: server streaming
+service PolicyService {
+  rpc StreamPolicy(PolicyStreamRequest) returns (stream PolicySnapshot);
+}
+message PolicyStreamRequest {
+  string proxy_id = 1;
+}
+
+// Proxy -> control plane: client streaming
+service TelemetryService {
+  rpc StreamTelemetry(stream TelemetryEvent) returns (TelemetryAck);
+}
+message TelemetryAck {
+  uint64 events_received    = 1;
+  int64  server_time_unix_ms = 2;
+}
+
+// React portal + CLI
+service AdminService {
+  rpc GetNodes(GetNodesRequest)           returns (GetNodesResponse);
+  rpc SwitchAlgorithm(SwitchAlgoRequest) returns (SwitchAlgoResponse);
+  rpc GetPolicySnapshot(GetPolicyRequest) returns (PolicySnapshot);
+  rpc GetMetrics(MetricsRequest)          returns (MetricsResponse);
+}
+
+message GetNodesRequest {}
+message NodeInfo {
+  string node_id         = 1;
+  string address         = 2;
+  bool   healthy         = 3;
+  int64  in_flight       = 4;
+  double cpu_util        = 5;
+  int64  queue_depth     = 6;
+  double latency_ewma_ms = 7;
+}
+message GetNodesResponse {
+  repeated NodeInfo nodes = 1;
+}
+
+message SwitchAlgoRequest {
+  Algorithm algo   = 1;
+  string    run_id = 2;
+}
+message SwitchAlgoResponse {
+  bool   ok      = 1;
+  string message = 2;
+}
+
+message GetPolicyRequest {}
+
+message MetricsRequest {
+  int64 window_s = 1;
+}
+message MetricsResponse {
+  string json_payload = 1;
+}

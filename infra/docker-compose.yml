@@ -1,0 +1,224 @@
+version: "3.9"
+
+# Synapse: docker compose for local development and experiment runs.
+# Phase 0: infrastructure only (Redis, TimescaleDB/Postgres, proxy stub, control plane stub).
+# Full service wiring in Phase 2 (proxy) and Phase 5 (control plane).
+#
+# Usage:
+#   make up     -> docker compose up -d
+#   make down   -> docker compose down -v
+#   make logs   -> docker compose logs -f
+
+networks:
+  synapse:
+    driver: bridge
+
+volumes:
+  redis-data:
+  timescale-data:
+  grafana-data:
+
+services:
+  # ------------------------------------------------------------------ #
+  # Redis — hot state, telemetry streams, pub/sub                       #
+  # ------------------------------------------------------------------ #
+  redis:
+    image: redis:7.4-alpine
+    container_name: synapse-redis
+    command: ["redis-server", "/etc/redis/redis.conf"]
+    volumes:
+      - ./infra/redis.conf:/etc/redis/redis.conf:ro
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - synapse
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ------------------------------------------------------------------ #
+  # TimescaleDB (PostgreSQL + TimescaleDB extension)                    #
+  # Single instance: 'config' schema (Postgres) + 'events' schema      #
+  # (TimescaleDB hypertable). See infra/init.sql.                       #
+  # ------------------------------------------------------------------ #
+  timescaledb:
+    image: timescale/timescaledb:2.17.0-pg16
+    container_name: synapse-timescaledb
+    environment:
+      POSTGRES_USER: synapse
+      POSTGRES_PASSWORD: synapse_dev_password
+      POSTGRES_DB: synapse
+    volumes:
+      - timescale-data:/var/lib/postgresql/data
+      - ./infra/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - synapse
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U synapse -d synapse"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ------------------------------------------------------------------ #
+  # Synapse Proxy (data plane) — Go                                     #
+  # Phase 0: stub image that just runs the healthz endpoint.            #
+  # ------------------------------------------------------------------ #
+  proxy:
+    build:
+      context: ./dataplane
+      dockerfile: Dockerfile
+    container_name: synapse-proxy
+    environment:
+      SYNAPSE_LISTEN: ":8080"
+      SYNAPSE_CP_ADDR: "controlplane:9090"
+      REDIS_ADDR: "redis:6379"
+      POSTGRES_DSN: "postgres://synapse:synapse_dev_password@timescaledb:5432/synapse?sslmode=disable"
+      TIMESCALE_DSN: "postgres://synapse:synapse_dev_password@timescaledb:5432/synapse?sslmode=disable"
+      SYNAPSE_RUN_ID: "local-dev"
+      SYNAPSE_METRICS_ADDR: ":9091"
+    ports:
+      - "8080:8080"
+      - "9091:9091"
+    networks:
+      - synapse
+    depends_on:
+      redis:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ------------------------------------------------------------------ #
+  # Synapse Control Plane — Python/FastAPI                              #
+  # Phase 0: stub that exposes /healthz only.                           #
+  # ------------------------------------------------------------------ #
+  controlplane:
+    build:
+      context: ./controlplane
+      dockerfile: Dockerfile
+    container_name: synapse-controlplane
+    environment:
+      REDIS_ADDR: "redis://redis:6379"
+      POSTGRES_DSN: "postgresql+asyncpg://synapse:synapse_dev_password@timescaledb:5432/synapse"
+    ports:
+      - "9080:9080"
+      - "9090:9090"
+    networks:
+      - synapse
+    depends_on:
+      redis:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:9080/healthz')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ------------------------------------------------------------------ #
+  # Mock Backend nodes (4 heterogeneous instances)                      #
+  # Phase 1: real mock service. Phase 0: placeholder using echo server. #
+  # Speed factors: 1.0, 1.0, 0.6, 1.5 (simulating heterogeneous HW)   #
+  # ------------------------------------------------------------------ #
+  backend-1:
+    image: hashicorp/http-echo:1.0.0
+    container_name: synapse-backend-1
+    command: ["-listen=:9000", "-text={\"node\":\"backend-1\",\"speed\":1.0}"]
+    environment:
+      NODE_ID: backend-1
+      SPEED_FACTOR: "1.0"
+    ports:
+      - "9001:9000"
+    networks:
+      - synapse
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  backend-2:
+    image: hashicorp/http-echo:1.0.0
+    container_name: synapse-backend-2
+    command: ["-listen=:9000", "-text={\"node\":\"backend-2\",\"speed\":1.0}"]
+    environment:
+      NODE_ID: backend-2
+      SPEED_FACTOR: "1.0"
+    ports:
+      - "9002:9000"
+    networks:
+      - synapse
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  backend-3:
+    image: hashicorp/http-echo:1.0.0
+    container_name: synapse-backend-3
+    command: ["-listen=:9000", "-text={\"node\":\"backend-3\",\"speed\":0.6}"]
+    environment:
+      NODE_ID: backend-3
+      SPEED_FACTOR: "0.6"
+    ports:
+      - "9003:9000"
+    networks:
+      - synapse
+    deploy:
+      resources:
+        limits:
+          cpus: "0.6"
+          memory: 512M
+
+  backend-4:
+    image: hashicorp/http-echo:1.0.0
+    container_name: synapse-backend-4
+    command: ["-listen=:9000", "-text={\"node\":\"backend-4\",\"speed\":1.5}"]
+    environment:
+      NODE_ID: backend-4
+      SPEED_FACTOR: "1.5"
+    ports:
+      - "9004:9000"
+    networks:
+      - synapse
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 512M
+
+  # ------------------------------------------------------------------ #
+  # Grafana + Prometheus (optional dev observability)                   #
+  # ------------------------------------------------------------------ #
+  prometheus:
+    image: prom/prometheus:v3.0.0
+    container_name: synapse-prometheus
+    volumes:
+      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    networks:
+      - synapse
+    profiles: ["observability"]
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: synapse-grafana
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - synapse
+    profiles: ["observability"]

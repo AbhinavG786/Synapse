@@ -1,0 +1,580 @@
+################################################################################
+SYNAPSE: IMPLEMENTATION MASTER PROMPT
+Contextual Multi-Armed Bandit Approach for Layer-7 Predictive API Load
+Balancing in Microservice Meshes
+################################################################################
+
+HOW TO USE THIS FILE
+Read this entire file before writing any code. It is the single source of truth
+for the project. Work phase by phase. Do not start a phase until the previous
+phase's exit criteria pass. After each phase, stop, summarise what was built,
+show the test/benchmark output, and wait for my go-ahead.
+
+Build order is fixed: Go backend first, ML control plane second, React
+frontend LAST (Phase 8).
+
+FIRST ACTION (do this and nothing else before replying):
+  1. Read this file fully.
+  2. Reply with: (a) a 10-line summary of your understanding, (b) a numbered
+     list of every assumption you are making, (c) any questions that would
+     change the architecture.
+  3. Then execute Phase 0 only.
+
+================================================================================
+SECTION 1. PROJECT IDENTITY
+================================================================================
+Title    : Synapse: A Contextual Multi-Armed Bandit Approach for Layer-7
+           Predictive API Load Balancing in Microservice Meshes
+Context  : 4th-year B.Tech CSE major project, JSS Academy of Technical
+           Education, Noida. Team: Abhinav Gupta, Siddhant Singh, Diksha Verma,
+           Vansh Kumar Nigam. Supervisor: Dr. Surekha M.
+Output   : A working system AND honest, reproducible experimental results that
+           feed a Springer-style review/methodology paper and the synopsis.
+
+The project has two equally important halves:
+  (A) An engineering artifact: a Go Layer-7 reverse proxy with an out-of-band
+      ML control plane and a React chaos/observability portal.
+  (B) A research claim: a contextual bandit (LinUCB) routing policy lowers
+      tail latency (P95/P99) on heterogeneous workloads versus Round-Robin,
+      Least-Connections, and Power-of-Two-Choices style baselines.
+Half (B) is evaluated with rigour. Never trade research validity for a prettier
+demo.
+
+================================================================================
+SECTION 2. PROBLEM STATEMENT AND NOVELTY (what we must demonstrate)
+================================================================================
+- "Uniform cost fallacy": GET /health and POST /report are treated as equal by
+  Round-Robin / Least-Connections. Request cost varies by orders of magnitude.
+- Head-of-line blocking: a heavy request on a node stalls the lighter ones
+  queued behind it. Tail latency amplification (P95/P99) follows.
+- Noisy neighbour / micro-stall / GC pause / CPU throttling: reactive health
+  checks (e.g. Envoy outlier detection, consecutive 5xx) fire only after users
+  already saw errors or timeouts.
+- Our approach: extract request context x (endpoint class, payload size,
+  headers, per-node CPU, queue depth, recent latency EWMA), and select a node
+  with a contextual bandit that is trained out-of-band, while the Go data plane
+  makes the decision with a cheap linear score against an atomically swapped
+  policy snapshot.
+- Why a bandit and not a full MDP / Deep RL: the proxy must decide in
+  sub-millisecond time; each routing decision has an almost immediate scalar
+  reward (observed latency); long-horizon credit assignment adds cost without
+  clear benefit. We acknowledge that load is a coupled system (our action
+  changes future state via queues), so the bandit is an approximation. This
+  limitation must appear in the docs and be probed by an ablation (A9).
+
+================================================================================
+SECTION 3. NON-NEGOTIABLE ENGINEERING RULES
+================================================================================
+R-1  No fabricated results. Every number in any report comes from a run whose
+     config, seed, git commit and raw output are saved under /results. If a
+     target is not met, report the real number.
+R-2  Targets are hypotheses, not facts. The synopsis states projected values
+     (e.g. 1.2 s fault detection, 95% traffic shift, <1 ms overhead). Treat
+     them as acceptance targets to test, never as pre-written outputs.
+R-3  Data plane never blocks on ML. If the control plane is down, slow, or
+     sends garbage, the proxy keeps routing using the last good snapshot, and
+     falls back to Least-Connections after a staleness TTL. This is tested.
+R-4  Hot path discipline: no allocation-heavy work, no network call, no DB
+     call, no mutex contention on the request path. Policy read is one atomic
+     pointer load. Telemetry is pushed to a bounded channel and dropped (with a
+     counter) if full, never blocking.
+R-5  Reproducibility: fixed RNG seeds, pinned dependency versions, docker
+     compose for the entire stack, one-command bench scripts (Makefile).
+R-6  Fair baselines: baselines run in the SAME proxy binary behind the same
+     interface, same connection pools, same hardware, same workload trace. We
+     do not compare Synapse-in-Go against nginx-in-C and call it algorithmic.
+     (An optional extra comparison to real Nginx/Envoy/HAProxy is allowed but
+     must be labelled "different proxy implementation".)
+R-7  Statistical honesty: minimum 10 independent runs per condition (different
+     seeds), report mean, median, and 95% bootstrap confidence intervals;
+     paired comparison or Mann-Whitney U for significance. Report effect sizes.
+     Discard nothing silently; record warmup separately.
+R-8  Open-loop load generation for latency measurements (constant-arrival-rate
+     / Poisson), to avoid coordinated omission. Closed-loop VUs only for
+     secondary throughput tests. Document which is which.
+R-9  Every phase ships tests (unit + integration), lint, and a short README
+     section. Go: `go vet`, `staticcheck`, `go test -race`. Python: `ruff`,
+     `mypy` (reasonable strictness), `pytest`.
+R-10 Ask before adding any dependency not listed in Section 5.
+R-11 Keep commits small and conventional (feat:, fix:, test:, docs:, bench:).
+R-12 Never silently change the reward definition, feature set, or evaluation
+     protocol. Changes require updating docs/DECISIONS.md with reason.
+
+================================================================================
+SECTION 4. ARCHITECTURE
+================================================================================
+Three planes:
+
+DATA PLANE (Go)
+  Client -> [Listener] -> [Feature Extractor] -> [Router (policy snapshot)]
+         -> [Dispatcher w/ connection pools] -> Backend node
+         -> response back to client; async emit Telemetry event.
+  - Reverse proxy built on net/http + httputil.ReverseProxy as the reference
+    path; a fasthttp variant is a stretch goal (Phase 2.9) benchmarked against
+    it. Decide with data, record in DECISIONS.md.
+  - Persistent keep-alive pools per backend, tuned MaxIdleConnsPerHost,
+    timeouts, HTTP/2 to backends where supported. Watch for socket exhaustion,
+    ephemeral port starvation, TIME_WAIT growth; document tuning.
+  - In-flight counters per backend (atomic int64) for Least-Connections and as
+    a context feature.
+  - Policy snapshot: immutable struct held in atomic.Pointer[PolicySnapshot].
+    Control-plane gRPC stream swaps it. Contains: version, created_at, TTL,
+    algorithm id, per-arm LinUCB parameters (see below) or weight vectors.
+  - Admin API (REST + WebSocket) for the React portal: list nodes, switch
+    algorithm live, set manual weights, inject nothing itself (chaos is done
+    on the backends/mocks), stream live metrics.
+  - Graceful drain, circuit-open on hard failure as a SAFETY NET only (the
+    research claim is about proactive routing; keep the safety net switchable
+    so ablation A6 can disable it).
+
+CONTROL PLANE (Python, FastAPI + gRPC + asyncio)
+  - Consumes telemetry (from Redis Stream or gRPC client-stream from Go).
+  - Maintains per-arm LinUCB state, trains out-of-band, publishes a policy
+    snapshot to the proxy about every 500 ms (configurable) over gRPC server
+    streaming. Also writes the hot copy to Redis.
+  - Optional latency predictor (XGBoost/LightGBM) to produce L-hat used as one
+    context feature / for comparison (see Section 6.4). Keep it optional and
+    ablatable; the core claim rests on LinUCB.
+  - REST + WebSocket for the React portal (metrics, policy introspection,
+    experiment control).
+  - Offline evaluation tools (simulator, replay, IPS, DR) live here too.
+
+UI PLANE (React) - LAST PHASE
+  React + TypeScript + Vite + Tailwind + shadcn/ui, React Flow topology,
+  Recharts, TanStack Query, WebSocket client.
+
+STORAGE
+  Redis        : hot state (policy snapshot copy, active connection counts,
+                 token buckets, pub/sub for UI). Streams for telemetry fan-in.
+  TimescaleDB  : hypertable `request_events` (ts, req_id, endpoint, method,
+                 payload_bytes, node_id, algo, policy_version, ctx jsonb or
+                 columns, t_exec_ms, status, error, reward, propensity,
+                 run_id). Continuous aggregates for P50/P95/P99 per minute.
+  PostgreSQL   : config (nodes, routes, policies, users/roles, experiments,
+                 runs). Can be the same Postgres instance with the Timescale
+                 extension but separate schemas.
+
+NOTE ON THE ROUTING SCORE FROM THE PAPER
+  Paper formula: Score(N_i) = alpha*L_hat(E_k, P_s, N_i) + beta*C_i + gamma*Q_i
+  This is the interpretable "cost view" (lower is better). The LinUCB view is
+  the learned generalisation. Implement BOTH as selectable policies:
+    - "heuristic-score": fixed alpha/beta/gamma, L_hat from a simple online
+      per-(endpoint,node) EWMA. A strong non-learning predictive baseline.
+    - "linucb": learned.
+  This lets us honestly separate "prediction helps" from "bandit exploration
+  helps". Document the mapping between the two in docs/MODEL.md.
+
+================================================================================
+SECTION 5. TECH STACK AND PINNED VERSIONS (confirm latest stable, then pin)
+================================================================================
+Go 1.22+, google.golang.org/grpc, protobuf, go-redis, pgx, prometheus client,
+  testify, gorilla/websocket or nhooyr websocket.
+Python 3.11+, FastAPI, uvicorn, grpcio + grpcio-tools, numpy, scipy, pandas,
+  scikit-learn, xgboost or lightgbm, redis-py (asyncio), asyncpg / SQLAlchemy,
+  pydantic v2, pytest, hypothesis (for bandit invariants), matplotlib (paper
+  figures, vector PDF output), ruff, mypy.
+Load/bench: k6 (constant-arrival-rate executor), Locust (secondary),
+  or a custom Go open-loop generator (preferred for exact Poisson arrivals).
+Infra: Docker, docker compose, Makefile, GitHub Actions (lint+test).
+Frontend (Phase 8): React 19, TypeScript, Vite, Tailwind, shadcn/ui,
+  @xyflow/react (React Flow), Recharts, TanStack Query.
+Observability: Prometheus + Grafana (dev-only, optional), pprof for Go.
+
+================================================================================
+SECTION 6. THE BANDIT: SPECIFICATION (research core, do not deviate silently)
+================================================================================
+6.1 Arms
+  Arm a = backend node N_i. Arms can be added/removed at runtime (node
+  registration, failure). Handle with per-arm state and a cold-start prior.
+
+6.2 Context vector x_t (dimension d, fixed, versioned)
+  Request features (extracted in Go in O(1), no body parsing beyond headers
+  and Content-Length):
+    - endpoint class (one-hot over configured route classes, e.g. light_crud,
+      medium_query, heavy_compute, io_bound), via route table not regex scan
+    - log1p(payload_bytes), normalised
+    - HTTP method class
+    - auth tier / priority header (optional)
+  System features per candidate node (shared or per-arm, see below):
+    - CPU utilisation (from node agent / mock backend /metrics)
+    - in-flight requests (proxy-side atomic counter)
+    - queue depth (reported by backend)
+    - latency EWMA short and long window, and their ratio (degradation signal)
+    - recent error rate
+    - metric age (staleness)
+  Normalisation: running mean/std or fixed scales, stored in the policy
+  snapshot so Go and Python agree exactly. Add a bias term.
+  DECISION TO MAKE IN PHASE 5 (and record): disjoint LinUCB (separate theta_a
+  per arm, context = request features + that arm's own system features) versus
+  hybrid LinUCB (shared + per-arm parameters). Start with disjoint; implement
+  hybrid as an ablation if time permits. Because system features differ per
+  arm, the context for arm a is x_{t,a}.
+
+6.3 Algorithm: LinUCB (Li, Chu, Langford, Schapire, WWW 2010)
+  For each arm a:  A_a = I_d * lambda_reg,  b_a = 0
+  Select:  a* = argmax_a  ( x_{t,a}^T theta_a + alpha * sqrt(x_{t,a}^T A_a^{-1} x_{t,a}) )
+           where theta_a = A_a^{-1} b_a
+  Update on reward r:  A_a += x x^T ;  b_a += r x
+  Maintain A_a^{-1} directly with Sherman-Morrison:
+           A^{-1} <- A^{-1} - (A^{-1} x x^T A^{-1}) / (1 + x^T A^{-1} x)
+  Numerical care: symmetrise, periodic re-inversion from A to bound drift,
+  float64 in training, float32 acceptable in the snapshot if tested equivalent.
+  Cite Li et al. 2010 as the canonical LinUCB reference in docs and code
+  comments (our review paper also cites Kveton et al.; keep Li et al. as the
+  primary source for the algorithm itself).
+
+6.4 Reward
+  Primary: r = -(t_exec_ms / scale) - lambda * 1[error or timeout]
+  - scale chosen per endpoint class (e.g. its baseline median) so heavy and
+    light requests are comparable; ALSO record raw latency for evaluation.
+  - lambda is a configurable large penalty; sweep it in ablation A5.
+  - Clip rewards to a bounded range (e.g. [-10, 0]) and document.
+  - Reward uses end-to-end proxy-observed latency (time to last byte from
+    backend), not backend-reported self time, to avoid reporting bias.
+
+6.5 Non-stationarity
+  Backends degrade and recover, so plain stationary LinUCB is wrong over long
+  horizons. Implement and ablate:
+    - exponential forgetting factor gamma_f in (0,1] on A and b
+      (A <- gamma_f*A + x x^T + (1-gamma_f)*lambda*I), or
+    - sliding-window variant,
+    - optional change detection (e.g. Page-Hinkley on per-node residuals) that
+      resets or inflates uncertainty for an arm.
+  Choose default by experiment, record in DECISIONS.md.
+
+6.6 Delayed and batched feedback
+  Rewards arrive after the decision and are sent in batches. The control plane
+  trains on a ~500 ms cadence from logged tuples (x, a, r, propensity).
+  Therefore the policy used by the proxy lags the learner. Quantify the effect
+  in ablation A3 (sync interval 100 ms / 500 ms / 2 s / 5 s).
+
+6.7 Propensities and exploration in the proxy
+  LinUCB is deterministic given parameters. For off-policy evaluation we need
+  logged action probabilities. Therefore the proxy log must include:
+    - the policy version used,
+    - for any randomised policy, the probability of the chosen action,
+    - for deterministic policies, an epsilon-floor mixture (e.g. epsilon=0.02
+      uniform) so propensities are strictly positive. The epsilon floor is also
+      a safe exploration guard. Make epsilon configurable and ablate (A2).
+
+6.8 Safety rails (must exist and be tested)
+  - Max exploration share cap per node under load.
+  - Cold-start: new node gets optimistic prior but a slow-start request cap.
+  - Fallback to Least-Connections when snapshot is stale (TTL) or invalid.
+  - Rate of policy swap bounded; reject snapshots with NaN/Inf or wrong dim.
+  - Heavy requests are never routed to a node whose in-flight exceeds a hard
+    cap, regardless of score.
+
+6.9 Policy snapshot wire format (protobuf)
+  PolicySnapshot { version, created_unix_ms, ttl_ms, feature_spec_version, d,
+    algo, alpha, repeated ArmParams { node_id, theta[d], A_inv[d*d] (or
+    Cholesky factor / low-rank approx if size matters), n_pulls },
+    normaliser { mean[], scale[] }, epsilon }
+  With d around 12-20 and N around 4-16 nodes, shipping full A_inv is cheap.
+  Go computes the UCB score locally (O(N * d^2) per request, a few microseconds).
+  Measure it with a Go benchmark and include it in results.
+
+6.10 Other policies to implement behind the same Router interface
+  B1 Round-Robin
+  B2 Weighted Round-Robin (static weights)
+  B3 Least-Connections (least in-flight)
+  B4 Power-of-Two-Choices on in-flight (random pair, pick lower)
+  B5 Least-Response-Time / EWMA latency (peak-EWMA style, reactive but smarter)
+  B6 Heuristic-score (Section 4 formula, alpha/beta/gamma, EWMA L_hat)
+  P1 LinUCB (the proposal)
+  P2 epsilon-greedy linear and Thompson Sampling (linear) as bandit baselines
+     (shows LinUCB is not an arbitrary choice)
+  P3 (stretch) a small DQN / MDP agent trained offline in the simulator, to
+     empirically justify "bandit vs full RL" with numbers. Not on the hot path.
+  An Oracle (offline, simulator only) for regret computation.
+
+================================================================================
+SECTION 7. WORKLOAD AND FAULT MODEL (what makes the evaluation meaningful)
+================================================================================
+Mock backend service (Go or Python/uvicorn; Go preferred for stable latency):
+  Endpoint classes with controllable cost:
+    GET  /health        ~0.2 ms        (light)
+    GET/POST /crud/*    ~2-10 ms       (light CRUD, cache-like)
+    POST /query         ~20-80 ms      (medium, DB-like)
+    POST /compute       ~100-800 ms CPU-bound, scales with payload (heavy)
+    POST /io            ~50-300 ms sleep-based (I/O bound)
+  Service time model: lognormal with endpoint-specific parameters and a
+  payload-size dependence. CPU-bound endpoints really burn CPU (bounded worker
+  pool per node so queues form and head-of-line blocking is real).
+  Each node exposes /metrics (cpu, in-flight, queue depth, GC pause stats).
+
+Heterogeneous nodes: configurable speed factors (e.g. 1.0, 1.0, 0.6, 1.5).
+Containers CPU-limited with cgroups so neighbours truly contend.
+
+Fault injection (controllable via an admin endpoint on each node, later wired
+to the React chaos panel):
+  F1 latency injection (+X ms, or xN multiplier)
+  F2 CPU throttle (reduce cpu quota or spin a competing burner)
+  F3 periodic GC-pause-like stalls (stop-the-world sleeps)
+  F4 queue saturation (shrink worker pool)
+  F5 hard failure (SIGKILL / refuse connections)
+  F6 gradual degradation ramp (the case where proactive detection should win)
+  F7 flapping node
+Each scenario has a scripted timeline (YAML) so runs are identical across
+algorithms.
+
+Traffic profiles (open-loop, Poisson arrivals, rate sweep):
+  W1 steady mixed (e.g. 70% light, 20% medium, 8% heavy, 2% io)
+  W2 heavy-skewed burst
+  W3 diurnal ramp
+  W4 adversarial: heavy requests clustered in time
+  W5 replay of a recorded trace (so every algorithm sees identical arrivals
+     and payload sizes; the common random numbers technique)
+Operate at utilisation levels e.g. 40%, 60%, 80%, 90% of cluster capacity.
+Load balancing differences usually appear near saturation; also report the
+low-load case honestly (little or no gain is an expected, valid result).
+
+================================================================================
+SECTION 8. EVALUATION PROTOCOL
+================================================================================
+Metrics: P50, P90, P95, P99, P99.9 end-to-end latency per endpoint class and
+  overall; error rate; goodput; timeouts; per-node load share and imbalance
+  (coefficient of variation, Jain's fairness index); fault detection time
+  (first time the degraded node's traffic share falls below 50% of its prior
+  share) and recovery time; proxy added latency (proxy-only overhead measured
+  against direct-to-backend); CPU/memory of the proxy; policy sync lag.
+Bandit metrics: cumulative regret vs oracle in the simulator, per-arm pull
+  counts, exploration share over time, theta drift.
+
+Experiments (ID, purpose):
+  E1 Proxy overhead: direct vs Go proxy (RR) at several rates. Target
+     hypothesis: added P99 < 1 ms at moderate load. Report truth.
+  E2 Main comparison: B1..B6, P1, P2 on W1 at 60/80/90% load. Primary result
+     table for the paper (P50/P99/error rate with 95% CI).
+  E3 Heterogeneous endpoints (W2/W4): shows head-of-line blocking relief.
+  E4 Fault scenarios F1-F7: detection time, traffic shift %, errors during the
+     transition, P99 during the fault window. Compare against reactive
+     baseline with outlier-detection-style ejection (B7 consecutive-5xx
+     ejection) to match the "reactive health check" claim fairly.
+  E5 Control-plane outage: kill the Python service mid-run; verify the proxy
+     keeps routing and the fallback TTL logic works (R-3).
+  E6 Scalability: nodes 4/8/16/32 and request rate up to saturation; proxy CPU
+     and decision cost.
+  E7 Learning curve / regret in the simulator over long horizons, plus
+     off-policy evaluation of logged real-run data (replay, IPS, SNIPS,
+     doubly-robust) to cross-check simulator results against live results.
+
+Ablations (each its own results table and figure):
+  A1 context features: request-only / system-only / both / +L_hat
+  A2 exploration: alpha sweep; epsilon floor sweep; UCB vs Thompson vs greedy
+  A3 sync interval: 100 ms / 500 ms / 2 s / 5 s (tests the 500 ms design choice)
+  A4 forgetting factor / window / change detection on vs off
+  A5 reward shape: latency-only vs latency+penalty; lambda sweep; scale choice
+  A6 safety nets: circuit-breaker/ejection on vs off (isolates what the
+     proactive policy contributes by itself)
+  A7 telemetry staleness injection (delayed or dropped metrics)
+  A8 cold start with new node joining mid-run
+  A9 coupling test: single-step bandit vs a small DQN/MDP in the simulator
+     (justifies bandit-vs-MDP with data; negative or neutral results are
+     reported as is)
+  A10 disjoint vs hybrid LinUCB
+  A11 decision cost: LinUCB scoring time vs d and N (Go microbenchmarks)
+
+Threats to validity section (write it into docs/): single-machine testbed,
+  synthetic workloads, simulator fidelity, container CPU noise, Go GC effects,
+  limited node counts, and the lack of real production traces.
+
+================================================================================
+SECTION 9. CLAIMS LEDGER (every claim in paper/synopsis maps to an experiment)
+================================================================================
+Maintain docs/CLAIMS.md with status: UNTESTED / SUPPORTED / REFUTED /
+INCONCLUSIVE, evidence path, and the exact figure/table.
+  C1  Proxy adds < 1 ms overhead at P99 under moderate load.        -> E1
+  C2  Decision (feature extract + route) is microsecond scale.      -> A11
+  C3  Synapse (LinUCB) lowers P99 vs RR and LC on mixed workloads.  -> E2, E3
+  C4  Gains grow with workload heterogeneity and load.              -> E2, E3
+  C5  Synapse shifts traffic away from degrading nodes before
+      error/timeout thresholds trip a reactive checker.             -> E4
+  C6  Detection/shift time is about 1-2 s (synopsis: 1.2 s, 95%).   -> E4
+  C7  Data plane survives control-plane outage.                     -> E5
+  C8  500 ms sync interval is a sound trade-off.                    -> A3
+  C9  Bandit is adequate vs a full MDP at far lower cost.           -> A9
+  C10 Sublinear regret / learning converges in simulator.           -> E7
+  C11 Offline estimators agree with live results within CI.         -> E7
+If a claim is REFUTED or INCONCLUSIVE, say so, and propose how the paper text
+should be modified. Do not hide it.
+
+================================================================================
+SECTION 10. REPOSITORY LAYOUT
+================================================================================
+synapse/
+  README.md  docs/{ARCHITECTURE,MODEL,DECISIONS,CLAIMS,EVALUATION,
+                   THREATS_TO_VALIDITY,RUNBOOK}.md
+  proto/            synapse.proto (policy, telemetry, admin)
+  dataplane/        Go module: cmd/proxy, internal/{router,policy,features,
+                    pool,telemetry,admin,fallback,config}, bench/
+  mocks/backend/    mock service + fault injector
+  controlplane/     Python package: synapse_cp/{bandit,policies,simulator,
+                    ope,training,api,storage,grpc_server,predictor}, tests/
+  loadgen/          open-loop generator, trace recorder/replayer, scenarios/
+  infra/            docker-compose.yml, timescale init SQL, redis conf
+  experiments/      configs/*.yaml, run_experiment.py, analysis notebooks
+  results/          raw logs (gitignored large files), tables, figures (PDF)
+  portal/           React app (Phase 8 only)
+  Makefile  .github/workflows/ci.yml
+
+================================================================================
+SECTION 11. PHASES AND EXIT CRITERIA
+================================================================================
+
+PHASE 0: Scaffolding and decisions
+  - Repo layout, Makefile, pinned toolchains, CI, docker compose skeleton
+    (redis, timescaledb/postgres), proto file draft, docs skeleton,
+    CLAIMS.md and DECISIONS.md seeded.
+  Exit: `make up`, `make test`, `make lint` run green on empty stubs.
+
+PHASE 1: Mock backends and fault injection
+  - Mock service with endpoint classes, bounded worker pools, lognormal service
+    times, /metrics, fault admin API, deterministic seeds.
+  - Containerised with CPU limits; 4 heterogeneous nodes in compose.
+  Exit: service-time distributions validated by tests/plots; every fault F1-F7
+  demonstrably changes latency/metrics; scripted timelines run reproducibly.
+
+PHASE 2: Go data plane core + classical baselines
+  2.1 Reverse proxy, pools, timeouts, graceful shutdown, health endpoint.
+  2.2 Router interface; RR, WRR, LC, P2C, Peak-EWMA, ejection-based reactive
+      checker (B7). In-flight tracking.
+  2.3 Feature extractor (route table lookup, Content-Length, headers).
+  2.4 Policy snapshot with atomic.Pointer, staleness TTL, fallback to LC.
+  2.5 Telemetry emitter: bounded channel, batcher, drop counter, run_id tags.
+  2.6 Prometheus metrics, pprof, structured logs.
+  2.7 Admin REST + WebSocket (live algorithm switch, node list, live stats).
+  2.8 Go microbenchmarks: per-decision cost, allocations (target 0 allocs/op
+      on hot path where feasible); race detector tests; connection-pool
+      exhaustion tests; TCP tuning notes (somaxconn, ephemeral ports, TIME_WAIT).
+  2.9 (Stretch) fasthttp variant; compare and decide.
+  Exit: all baselines route correctly under tests; E1 proxy overhead measured
+  with raw results saved; no data races; go vet/staticcheck clean.
+
+PHASE 3: Telemetry pipeline and storage
+  - Redis Streams ingestion, Timescale schema + hypertable + continuous
+    aggregates, Postgres config schema, migrations, async writer with
+    backpressure, retention policy.
+  - Telemetry schema includes context vector, action, policy version,
+    propensity, reward inputs.
+  Exit: sustained ingest at 2x the target request rate with bounded loss;
+  percentile queries match client-side percentiles within tolerance.
+
+PHASE 4: Load-test harness and baseline study
+  - Open-loop Poisson generator, trace record/replay, scenario runner (YAML
+    scenarios from Section 7), run orchestration (seeded, repeated, tagged
+    run_id), result collection, analysis scripts (bootstrap CI, Mann-Whitney,
+    plots as vector PDFs in paper style).
+  - k6/Locust scripts as secondary, clearly labelled.
+  Exit: E2 baseline-only table (B1-B7) reproduced across >=10 seeds with CIs;
+  demonstrate the uniform-cost-fallacy and head-of-line effect on RR/LC
+  (this is the "problem exists" evidence, must be present before ML work).
+
+PHASE 5: ML control plane (Python)
+  5.1 LinUCB with Sherman-Morrison, forgetting, tests (hypothesis property
+      tests: A_inv * A ~ I; regret on synthetic linear bandit decreases;
+      invariance checks; determinism with seed).
+  5.2 Thompson, epsilon-greedy, heuristic-score, oracle.
+  5.3 Feature spec shared by Go and Python (single JSON/proto spec; golden
+      test vectors proving Go and Python compute identical scores to 1e-5).
+  5.4 Simulator: discrete-event queueing model calibrated against Phase 1/4
+      measurements (validate it: compare simulated vs measured latency
+      distributions before trusting it).
+  5.5 Offline evaluation: replay, IPS, SNIPS, doubly-robust, with the
+      logged propensities from Section 6.7.
+  5.6 Trainer service: consumes telemetry, updates arms, publishes snapshot
+      ~500 ms via gRPC stream + Redis; validates snapshots before publish.
+  5.7 FastAPI: health, policy introspection, experiment control, metrics.
+  5.8 Optional XGBoost/LightGBM latency predictor producing L-hat feature.
+  5.9 (Stretch) small DQN for A9.
+  Exit: simulator regret curves; live integration where the Go proxy runs
+  LinUCB from the streamed snapshot; E5 control-plane outage passes; golden
+  vectors pass; control-plane CPU/latency profile recorded.
+
+PHASE 6: Full evaluation and ablations
+  - Run E2-E7 and A1-A11 per Section 8 with seeds, CIs, saved raw data.
+  - Generate final tables/figures (vector PDF, LaTeX-ready booktabs tables,
+    consistent fonts), plus a results summary markdown.
+  Exit: results/ complete and reproducible via `make reproduce` (documented
+  runtime); every claim C1-C11 has a status in CLAIMS.md.
+
+PHASE 7: Hardening and claims audit
+  - Soak test (hours), chaos on control plane + Redis + DB, memory leak and
+    goroutine leak checks, config validation, security basics (admin auth,
+    CORS, rate limits, secrets via env), failure-mode docs.
+  - Audit: compare every number in the synopsis/paper to measured results and
+    output a diff report listing which statements must be edited.
+  Exit: no leaks, no data races, audit report written.
+
+PHASE 8: React chaos and observability portal (LAST)
+  Only now. Stack per Section 5. Modules:
+    1. Live Topology Mesh (React Flow): nodes, health badges, CPU/queue bars,
+       animated edges proportional to traffic share.
+    2. Chaos Panel: sliders/buttons that call the mock-backend fault admin API
+       (F1-F7), with a timeline of injected faults.
+    3. Algorithm Benchmarker: switch RR / LC / P2C / LinUCB live; run a
+       preset scenario; side-by-side live P50/P95/P99 charts and a replay of
+       a recorded run for demos that must be deterministic.
+    4. Bandit Introspection: per-node UCB terms (exploit vs exploration bonus),
+       pull counts, exploration share, policy version and sync lag. This is
+       the research-visible view; do not omit it.
+    5. Policy Console: alpha, epsilon, forgetting, sync interval, safety caps,
+       route-class table, rate limits (config persisted in Postgres).
+    6. Experiment viewer: list past runs, CI plots from /results.
+  Realtime via WebSocket; REST via TanStack Query; auth for admin actions.
+  Exit: demo script that walks through fault injection and shows traffic
+  shifting live; Playwright smoke tests; build passes.
+
+PHASE 9: Documentation and paper-ready output
+  - README quickstart, architecture diagrams (mermaid + exported PDFs), final
+    DECISIONS/CLAIMS/EVALUATION/THREATS docs, a "results to paper" mapping
+    file listing exactly which table/figure replaces which placeholder in the
+    synopsis (main.tex) and review paper, and a 5-minute demo script.
+  Exit: a new machine can reproduce headline results from the README alone.
+
+================================================================================
+SECTION 12. DEFINITION OF DONE (overall)
+================================================================================
+[ ] All phases pass their exit criteria, tests green, CI green.
+[ ] Every baseline and the proposed policy run behind the same Router interface.
+[ ] Headline tables with 95% CIs from >=10 seeds exist in results/.
+[ ] All 11 claims have an evidence-backed status, including unfavourable ones.
+[ ] Control-plane outage behaviour verified.
+[ ] Go/Python score equivalence verified by golden vectors.
+[ ] Portal shows live topology, chaos injection, algorithm switch, bandit
+    introspection.
+[ ] Reproducible by one command sequence from a clean checkout.
+
+================================================================================
+SECTION 13. KNOWN RISKS (plan for them, tell me early if they bite)
+================================================================================
+RK1 Bandit shows no gain at low load. Expected. Report honestly; show where
+    gains appear (high utilisation, heterogeneity, faults).
+RK2 Non-stationarity breaks plain LinUCB. Mitigation: forgetting + change
+    detection (6.5), ablation A4.
+RK3 Action-induced state (queues) violates bandit assumptions. Mitigation:
+    include in-flight/queue in context; A9 tests it against an MDP.
+RK4 Simulator-vs-live mismatch. Mitigation: calibrate and validate; OPE
+    cross-check (E7).
+RK5 Single-machine noise (CPU contention between loadgen, proxy, backends).
+    Mitigation: pin CPUs (taskset/cpuset), separate loadgen cores, record host
+    info; repeat runs.
+RK6 Coordinated omission. Mitigation: open-loop generator (R-8).
+RK7 Pressure to match the synopsis numbers. Mitigation: R-1, R-2. The paper
+    gets edited to match reality, never the reverse.
+RK8 Time. Mitigation: the Phase 2 baselines + Phase 4 evidence + Phase 5
+    LinUCB + E2/E4 are the minimum viable research result. Phases 5.9, 2.9,
+    A9, A10 and hybrid LinUCB are stretch.
+
+================================================================================
+SECTION 14. COMMUNICATION PROTOCOL WITH ME
+================================================================================
+- At the end of every phase: list files created, how to run them, test output,
+  any deviations from this spec, open questions, and the proposed next step.
+- Surface any spec ambiguity or conflict immediately instead of guessing.
+- Keep a running docs/DECISIONS.md (date, decision, alternatives, reason).
+- When something fails, report the real failure and root cause.
+- Prefer small, reviewable increments over large unreviewed drops.
+
+BEGIN NOW with the FIRST ACTION in the "HOW TO USE THIS FILE" section.
+################################################################################

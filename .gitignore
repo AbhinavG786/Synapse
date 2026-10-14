@@ -1,0 +1,37 @@
+# Go
+dataplane/synapse-proxy
+dataplane/*.test
+dataplane/vendor/
+
+# Python
+controlplane/__pycache__/
+controlplane/**/__pycache__/
+controlplane/*.pyc
+controlplane/.mypy_cache/
+controlplane/.ruff_cache/
+controlplane/.pytest_cache/
+controlplane/dist/
+controlplane/*.egg-info/
+
+# Results (raw log files are large; tables/figures are committed)
+results/*.log
+results/*.json.gz
+results/*.csv.gz
+
+# Secrets
+.env
+*.env.local
+**/.env
+
+# Docker
+.docker/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
