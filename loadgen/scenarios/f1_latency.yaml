@@ -1,0 +1,47 @@
+# F1: Latency injection on backend-3
+# Injects +200ms additional latency from t=10s to t=40s, then clears.
+# Expected outcome: proxy should detect the degradation and reduce traffic to backend-3.
+# Used by experiment E4 (fault detection time).
+
+name: f1_latency_injection
+description: >
+  Adds 200ms of extra latency to backend-3 from t=10s to t=40s.
+  backend-3 is already 40% slower (speed_factor=0.6); the combined
+  effect produces ~320ms+ median on /query, clearly above baseline.
+fault_type: F1
+target_nodes: [backend-3]
+
+steps:
+  - at_s: 0.0
+    action: baseline
+    description: "Steady-state before fault injection"
+
+  - at_s: 10.0
+    node: backend-3
+    action: set_fault
+    fault:
+      F1LatencyAddMs: 200.0
+      F1LatencyMul: 1.0
+    description: "+200ms latency injection on backend-3"
+
+  - at_s: 40.0
+    node: backend-3
+    action: clear_fault
+    description: "Recovery: clear all faults on backend-3"
+
+  - at_s: 70.0
+    action: end
+    description: "Observe recovery period"
+
+total_duration_s: 70
+warmup_s: 10
+measurement_window: [10, 70]
+
+# Detection criterion: traffic share to backend-3 drops below 50% of its
+# pre-fault share within 1-2s of fault onset (t=10s).
+detection_criterion:
+  metric: traffic_share
+  node: backend-3
+  threshold_fraction: 0.5   # <50% of prior share
+  window_start_s: 10.0
+  window_end_s: 20.0

@@ -126,17 +126,25 @@ services:
       retries: 5
 
   # ------------------------------------------------------------------ #
-  # Mock Backend nodes (4 heterogeneous instances)                      #
-  # Phase 1: real mock service. Phase 0: placeholder using echo server. #
-  # Speed factors: 1.0, 1.0, 0.6, 1.5 (simulating heterogeneous HW)   #
+  # Mock Backend nodes — 4 heterogeneous instances                     #
+  # Speed factors: 1.0, 1.0, 0.6 (slower), 1.5 (faster)               #
+  # CPU limits enforce true contention so head-of-line blocking is real.#
+  # Fault injection via POST /admin/fault on each node.                 #
   # ------------------------------------------------------------------ #
   backend-1:
-    image: hashicorp/http-echo:1.0.0
+    build:
+      context: ./mocks/backend
+      dockerfile: Dockerfile
     container_name: synapse-backend-1
-    command: ["-listen=:9000", "-text={\"node\":\"backend-1\",\"speed\":1.0}"]
     environment:
       NODE_ID: backend-1
       SPEED_FACTOR: "1.0"
+      LISTEN_ADDR: ":9000"
+      MAX_WORKERS_COMPUTE: "4"
+      MAX_WORKERS_IO: "10"
+      MAX_WORKERS_QUERY: "8"
+      MAX_WORKERS_CRUD: "30"
+      SEED: "1001"
     ports:
       - "9001:9000"
     networks:
@@ -145,15 +153,27 @@ services:
       resources:
         limits:
           cpus: "1.0"
-          memory: 512M
+          memory: 256M
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   backend-2:
-    image: hashicorp/http-echo:1.0.0
+    build:
+      context: ./mocks/backend
+      dockerfile: Dockerfile
     container_name: synapse-backend-2
-    command: ["-listen=:9000", "-text={\"node\":\"backend-2\",\"speed\":1.0}"]
     environment:
       NODE_ID: backend-2
       SPEED_FACTOR: "1.0"
+      LISTEN_ADDR: ":9000"
+      MAX_WORKERS_COMPUTE: "4"
+      MAX_WORKERS_IO: "10"
+      MAX_WORKERS_QUERY: "8"
+      MAX_WORKERS_CRUD: "30"
+      SEED: "1002"
     ports:
       - "9002:9000"
     networks:
@@ -162,15 +182,27 @@ services:
       resources:
         limits:
           cpus: "1.0"
-          memory: 512M
+          memory: 256M
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   backend-3:
-    image: hashicorp/http-echo:1.0.0
+    build:
+      context: ./mocks/backend
+      dockerfile: Dockerfile
     container_name: synapse-backend-3
-    command: ["-listen=:9000", "-text={\"node\":\"backend-3\",\"speed\":0.6}"]
     environment:
       NODE_ID: backend-3
       SPEED_FACTOR: "0.6"
+      LISTEN_ADDR: ":9000"
+      MAX_WORKERS_COMPUTE: "2"   # fewer workers → queues faster
+      MAX_WORKERS_IO: "6"
+      MAX_WORKERS_QUERY: "5"
+      MAX_WORKERS_CRUD: "20"
+      SEED: "1003"
     ports:
       - "9003:9000"
     networks:
@@ -179,15 +211,27 @@ services:
       resources:
         limits:
           cpus: "0.6"
-          memory: 512M
+          memory: 256M
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   backend-4:
-    image: hashicorp/http-echo:1.0.0
+    build:
+      context: ./mocks/backend
+      dockerfile: Dockerfile
     container_name: synapse-backend-4
-    command: ["-listen=:9000", "-text={\"node\":\"backend-4\",\"speed\":1.5}"]
     environment:
       NODE_ID: backend-4
       SPEED_FACTOR: "1.5"
+      LISTEN_ADDR: ":9000"
+      MAX_WORKERS_COMPUTE: "6"   # more workers → handles heavy load better
+      MAX_WORKERS_IO: "15"
+      MAX_WORKERS_QUERY: "12"
+      MAX_WORKERS_CRUD: "40"
+      SEED: "1004"
     ports:
       - "9004:9000"
     networks:
@@ -196,7 +240,12 @@ services:
       resources:
         limits:
           cpus: "1.5"
-          memory: 512M
+          memory: 256M
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   # ------------------------------------------------------------------ #
   # Grafana + Prometheus (optional dev observability)                   #
