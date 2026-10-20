@@ -1,6 +1,7 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-asyncio_mode = "auto"
+pythonpath = ["."]
+# asyncio_mode = "auto"  # requires pytest-asyncio; enabled in Phase 5
 
 [tool.ruff]
 line-length = 100
