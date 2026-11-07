@@ -209,6 +209,7 @@ func (c *Controller) runCPUBurner(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			_ = sink // prevent compiler from eliding the work
 			return
 		default:
 			sink += math.Sqrt(float64(i)*3.14159) + math.Log1p(float64(i+1))
@@ -219,7 +220,6 @@ func (c *Controller) runCPUBurner(ctx context.Context) {
 			}
 		}
 	}
-	_ = sink
 }
 
 // runStallTicker periodically sets the F3 stall signal (F3).

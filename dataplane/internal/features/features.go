@@ -140,6 +140,24 @@ func (e *Extractor) BuildVector(req RequestFeatures, node NodeMetrics) ContextVe
 	return v
 }
 
+// ClassName returns the string name of an EndpointClass.
+func ClassName(c EndpointClass) string {
+	switch c {
+	case ClassLightCRUD:
+		return "light_crud"
+	case ClassMediumQuery:
+		return "medium_query"
+	case ClassHeavyCompute:
+		return "heavy_compute"
+	case ClassIOBound:
+		return "io_bound"
+	case ClassHealth:
+		return "health"
+	default:
+		return "unknown"
+	}
+}
+
 // classifyRoute returns the EndpointClass for a URL path using the route table.
 // Falls back to ClassUnknown if no prefix matches. O(len(routeTable)) worst-case
 // but table is small (< 20 entries); a trie is a Phase 2.3 optimisation.

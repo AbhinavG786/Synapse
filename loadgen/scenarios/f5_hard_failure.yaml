@@ -1,0 +1,40 @@
+# F5: Hard failure on backend-3
+# backend-3 returns 503 for all requests from t=10s to t=40s.
+# Expected: proxy detects immediately (error_rate → 1.0) and routes
+# 0% traffic to backend-3 within 1-2s.
+
+name: f5_hard_failure
+description: >
+  backend-3 returns 503 for all requests. This is the reactive-checker
+  baseline case — even a simple 5xx ejector should handle it.
+  Used as a sanity check that the bandit is at least as fast.
+fault_type: F5
+target_nodes: [backend-3]
+
+steps:
+  - at_s: 0.0
+    action: baseline
+
+  - at_s: 10.0
+    node: backend-3
+    action: set_fault
+    fault:
+      F5HardFail: true
+
+  - at_s: 40.0
+    node: backend-3
+    action: clear_fault
+
+  - at_s: 70.0
+    action: end
+
+total_duration_s: 70
+warmup_s: 10
+
+detection_criterion:
+  metric: error_rate
+  node: backend-3
+  threshold: 0.9          # error rate should drop below 10% within window
+  window_start_s: 10.0
+  window_end_s: 15.0
+

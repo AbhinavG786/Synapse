@@ -53,11 +53,15 @@ func New(n int) *Pool {
 // Acquire waits until a worker slot is available or ctx is cancelled.
 // On success, callers MUST call Release() exactly once when done.
 //
-// Returns ErrPoolFull immediately if the dynamic cap (SetCap) is reached,
-// without waiting for a slot — this is the F4 (queue saturation) behaviour.
+// F4 (queue saturation) semantics: when SetCap has been used to reduce the
+// effective cap below maxCap, new arrivals are IMMEDIATELY rejected with
+// ErrPoolFull if inflight >= dynamicCap — without entering the wait queue.
+// This correctly simulates "queue full" behaviour. When the pool is at its
+// natural maxCap limit, the caller blocks on the channel (normal backpressure).
 func (p *Pool) Acquire(ctx context.Context) error {
-	// F4: dynamic cap check — reject immediately if already at cap.
-	if p.inflight.Load() >= p.cap.Load() {
+	// F4 fast-reject: only fires when dynamic cap has been reduced below maxCap.
+	// When cap == maxCap, we let the channel naturally block (normal operation).
+	if p.cap.Load() < p.maxCap && p.inflight.Load() >= p.cap.Load() {
 		return ErrPoolFull
 	}
 
@@ -66,9 +70,6 @@ func (p *Pool) Acquire(ctx context.Context) error {
 
 	select {
 	case p.tokens <- struct{}{}:
-		// Re-check after acquiring the channel slot — the cap may have
-		// changed while we were waiting. Accept anyway; F4 is "soft" in
-		// that it rejects new arrivals but lets queued ones through.
 		p.inflight.Add(1)
 		return nil
 	case <-ctx.Done():

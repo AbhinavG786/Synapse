@@ -1,0 +1,33 @@
+# F4: Queue saturation on backend-2
+# Shrinks the compute worker pool from 4→1 from t=10s to t=50s.
+# Expected: 429 responses on /compute for backend-2; proxy shifts
+# traffic to uncongested nodes.
+
+name: f4_queue_saturation
+description: >
+  Reduces backend-2 compute pool to 1 worker at t=10s, saturating
+  the queue and causing 429 TooManyRequests for /compute.
+  Tests whether the proxy detects queue-depth signals proactively.
+fault_type: F4
+target_nodes: [backend-2]
+
+steps:
+  - at_s: 0.0
+    action: baseline
+
+  - at_s: 10.0
+    node: backend-2
+    action: set_fault
+    fault:
+      F4WorkerCap: 1
+
+  - at_s: 50.0
+    node: backend-2
+    action: clear_fault
+
+  - at_s: 80.0
+    action: end
+
+total_duration_s: 80
+warmup_s: 10
+

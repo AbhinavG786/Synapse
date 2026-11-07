@@ -1,0 +1,32 @@
+# F2: CPU throttle on backend-2
+# 4 competing CPU-burner goroutines from t=10s to t=50s.
+# Saturates backend-2's CPU, increasing latency for all /compute requests.
+# No 5xx errors — only latency degrades. Reactive 5xx ejector won't fire.
+
+name: f2_cpu_throttle
+description: >
+  Spins 4 CPU-burner goroutines on backend-2, competing with the 4
+  compute worker pool slots. All compute latencies increase.
+  Error rate stays near 0 — tests proactive latency-based detection.
+fault_type: F2
+target_nodes: [backend-2]
+
+steps:
+  - at_s: 0.0
+    action: baseline
+
+  - at_s: 10.0
+    node: backend-2
+    action: set_fault
+    fault:
+      F2CPUBurners: 4
+
+  - at_s: 50.0
+    node: backend-2
+    action: clear_fault
+
+  - at_s: 80.0
+    action: end
+
+total_duration_s: 80
+warmup_s: 10

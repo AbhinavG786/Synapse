@@ -1,0 +1,44 @@
+# F6: Gradual degradation ramp on backend-4
+# Linearly increasing latency (+50ms/s) from t=10s to t=60s, then clears.
+# This is the key scenario where proactive detection should win over reactive:
+# latency grows slowly, error rate stays at 0, but P99 steadily climbs.
+
+name: f6_gradual_degradation
+description: >
+  backend-4 latency increases at 50ms/s from t=10s. After 20s the
+  node has accumulated +1000ms on every request. No errors until it
+  times out — only latency EWMA signals degrade first.
+  This is the primary scenario for C5/C6: proactive vs reactive.
+fault_type: F6
+target_nodes: [backend-4]
+
+steps:
+  - at_s: 0.0
+    action: baseline
+
+  - at_s: 10.0
+    node: backend-4
+    action: set_fault
+    fault:
+      F6RampRateMs: 50.0   # +50ms per second
+
+  - at_s: 60.0
+    node: backend-4
+    action: clear_fault
+    description: "Ramp cleared; observe recovery"
+
+  - at_s: 90.0
+    action: end
+
+total_duration_s: 90
+warmup_s: 10
+
+# Key measurement: how quickly does traffic shift AWAY from backend-4
+# as its EWMA latency degrades, before it starts returning errors/timeouts?
+detection_criterion:
+  metric: traffic_share
+  node: backend-4
+  threshold_fraction: 0.5    # <50% of pre-fault share
+  window_start_s: 10.0
+  window_end_s: 35.0         # 25s detection window; target ≤ ~1.2s shift onset
+

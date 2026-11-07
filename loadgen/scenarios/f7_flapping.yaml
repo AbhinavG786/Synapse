@@ -1,0 +1,38 @@
+# F7: Flapping node — backend-1
+# backend-1 alternates between hard-fail and normal every 2s from t=10s to t=60s.
+# Tests how well the routing policy handles high-variance, oscillating signals.
+# A bandit with forgetting (γ) should track this better than a pure reactive ejector.
+
+name: f7_flapping_node
+description: >
+  backend-1 flaps: 503 for 2s, normal for 2s, repeat.
+  Hard for reactive ejectors with hysteresis (they may keep ejecting
+  during recovery windows). Bandit with forgetting should adapt faster.
+fault_type: F7
+target_nodes: [backend-1]
+
+steps:
+  - at_s: 0.0
+    action: baseline
+
+  - at_s: 10.0
+    node: backend-1
+    action: set_fault
+    fault:
+      F7FlappingIntervalMs: 2000.0
+
+  - at_s: 60.0
+    node: backend-1
+    action: clear_fault
+
+  - at_s: 90.0
+    action: end
+
+total_duration_s: 90
+warmup_s: 10
+
+# Measurements:
+#   - error_rate during fault window (lower is better: policy avoids flapping node)
+#   - recovery response time each time backend-1 comes back (is traffic restored?)
+#   - Jain's fairness index across all nodes during the fault window
+

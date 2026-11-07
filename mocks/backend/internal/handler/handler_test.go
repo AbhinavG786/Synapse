@@ -108,12 +108,23 @@ func TestF5HardFail(t *testing.T) {
 
 	fc.Set(fault.Config{F5HardFail: true})
 
-	for _, path := range []string{"/health", "/crud/x", "/query", "/io"} {
-		req := httptest.NewRequest(http.MethodGet, path, nil)
+	// Use correct methods per endpoint so method checks don't fire before F5.
+	f5cases := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/health"},
+		{http.MethodGet, "/crud/x"},
+		{http.MethodPost, "/query"},
+		{http.MethodPost, "/io"},
+		{http.MethodPost, "/compute"},
+	}
+	for _, tc := range f5cases {
+		req := httptest.NewRequest(tc.method, tc.path, nil)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		if rec.Code != http.StatusServiceUnavailable {
-			t.Errorf("path %s with F5: expected 503, got %d", path, rec.Code)
+			t.Errorf("path %s with F5: expected 503, got %d", tc.path, rec.Code)
 		}
 	}
 

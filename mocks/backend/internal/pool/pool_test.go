@@ -61,16 +61,16 @@ func TestF4DynamicCap(t *testing.T) {
 		}
 	}
 
-	// Set cap to 3 — now the pool is at cap
+	// Set cap to 3 (< maxCap=5) — now inflight(3) >= dynamicCap(3) triggers fast-reject.
 	p.SetCap(3)
 
-	// New arrivals should be rejected immediately (ErrPoolFull)
+	// New arrivals should be rejected immediately (ErrPoolFull) due to F4.
 	err := p.Acquire(ctx)
 	if err != pool.ErrPoolFull {
 		t.Errorf("expected ErrPoolFull, got %v", err)
 	}
 
-	// Release one and reset cap — should allow entry again
+	// Release one and reset cap — should allow entry again.
 	p.Release()
 	p.ResetCap()
 	if err := p.Acquire(ctx); err != nil {
@@ -78,7 +78,7 @@ func TestF4DynamicCap(t *testing.T) {
 		return
 	}
 
-	// cleanup
+	// cleanup: 2 acquired above remain + 1 just acquired
 	for range 3 {
 		p.Release()
 	}
@@ -108,31 +108,41 @@ func TestConcurrentSafety(t *testing.T) {
 }
 
 func TestQueuedCounter(t *testing.T) {
-	p := pool.New(1)
+	// Pool with 2 slots. Fill both, then a third goroutine must block
+	// on the channel send → Queued() increments.
+	p := pool.New(2)
 	ctx := context.Background()
 
-	// Fill the single slot
+	// Fill both slots
 	if err := p.Acquire(ctx); err != nil {
-		t.Fatal(err)
+		t.Fatal("acquire 1:", err)
+	}
+	if err := p.Acquire(ctx); err != nil {
+		t.Fatal("acquire 2:", err)
 	}
 
-	started := make(chan struct{})
 	done := make(chan struct{})
 
 	go func() {
-		close(started)
-		shortCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+		defer close(done)
+		shortCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 		defer cancel()
-		_ = p.Acquire(shortCtx)
-		close(done)
+		_ = p.Acquire(shortCtx) // must block: channel is full
 	}()
 
-	<-started
-	time.Sleep(10 * time.Millisecond) // let goroutine block on Acquire
+	// Poll until the goroutine is counted as queued.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if p.Queued() >= 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
 	if q := p.Queued(); q < 1 {
-		t.Errorf("expected Queued >= 1, got %d", q)
+		t.Errorf("expected Queued >= 1 while goroutine blocks on Acquire, got %d", q)
 	}
 
 	p.Release() // unblock the waiting goroutine
 	<-done
+	p.Release() // cleanup remaining slot
 }
